@@ -296,7 +296,7 @@ func Start(currencies []string, samplesToStudy int, futurePeriod int, samplePeri
 	go oracle.collectSamples()
 	for _, curr := range(currencies) {
 		for f := 1; f <= futurePeriod; f++ {
-			for s := 1; s <= samplesToStudy; s++ {
+			for s := 2; s <= samplesToStudy; s++ {
 				go oracle.makePredictions(curr, f, s)
 			}
 		}
