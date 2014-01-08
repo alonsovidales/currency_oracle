@@ -200,13 +200,10 @@ func (oracle *oracleStruc) makePredictions(curr string, futurePeriod int, sample
 			// Make a copy of the objects in order to avoid problems when update the rates
 			oracle.mutex.Lock()
 			samplesBid := make([]float64, samplesToStudy)
-			copy(samplesBid, oracle.samplesBid[curr][len(oracle.samplesBid) - samplesToStudy:])
+			copy(samplesBid, oracle.samplesBid[curr][len(oracle.samplesBid[curr]) - samplesToStudy:])
 			samplesAsk := make([]float64, samplesToStudy)
-			copy(samplesAsk, oracle.samplesAsk[curr][len(oracle.samplesBid) - samplesToStudy:])
+			copy(samplesAsk, oracle.samplesAsk[curr][len(oracle.samplesAsk[curr]) - samplesToStudy:])
 			oracle.mutex.Unlock()
-
-			fmt.Println("To Study---->>>>>", samplesToStudy, samplesBid)
-			fmt.Println("To Study---->>>>>", samplesToStudy, samplesAsk)
 
 			futBid, thrend := getFutureBidPrice(samplesBid, futurePeriod)
 			currentBid := samplesBid[len(samplesBid) - 1]
