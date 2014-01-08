@@ -29,7 +29,7 @@ const (
 	VERBOSE = false
 	PRODUCTION = false
 
-	THRENDS_TO_CONSIDER = 10
+	THRENDS_TO_CONSIDER = 5
 	MAX_BENEFIT_TO_CONSIDERER = 10
 
 	INCR_MARGIN = 1.0
@@ -220,7 +220,7 @@ func (oracle *oracleStruc) makePredictions(curr string, futurePeriod int, sample
 			}
 
 			// Buy
-			if futBid > (currentAsk * INCR_MARGIN) && inverted == 0 && isThrendValid(validThrends, invalidThrends, thrend * currentAsk) {
+			if futBid > (currentAsk * INCR_MARGIN) && inverted == 0 && isThrendValid(validThrends, invalidThrends, thrend) {
 				order, err := oracle.account.placeOrder(
 					fmt.Sprintf("%s_%s", oracle.baserCurr, curr),
 					unitsByOp,
@@ -233,7 +233,7 @@ func (oracle *oracleStruc) makePredictions(curr string, futurePeriod int, sample
 					inverted = unitsByOp / order.Price
 					boughtAt = order.Price
 					threndAt = thrend
-					exangeAt = currentAsk * thrend
+					exangeAt = thrend
 					fmt.Println(CLR_R, oracle.internalClock, "Buy:", curr, samplesToStudy, futurePeriod, order.Price, oracle.units, CLR_N)
 				}
 			}
