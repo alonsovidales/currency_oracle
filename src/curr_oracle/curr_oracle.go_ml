@@ -1,0 +1,217 @@
+package curr_oracle
+
+import (
+	"fmt"
+	"strings"
+	"time"
+	"os"
+	"strconv"
+	"io/ioutil"
+	"encoding/json"
+	"net/http"
+	"sync"
+	"github.com/alonsovidales/go_ml"
+)
+
+const (
+	CLR_0 = "\x1b[30;1m"
+	CLR_R = "\x1b[31;1m"
+	CLR_G = "\x1b[32;1m"
+	CLR_Y = "\x1b[33;1m"
+	CLR_B = "\x1b[34;1m"
+	CLR_M = "\x1b[35;1m"
+	CLR_C = "\x1b[36;1m"
+	CLR_W = "\x1b[37;1m"
+	CLR_N = "\x1b[0m"
+
+	FEEDS_URL = "http://api-sandbox.oanda.com/v1/quote?instruments="
+
+	VERBOSE = false
+)
+
+type oracleStruc struct {
+	baserCurr string
+	currencies []string
+	samplesToStudy int
+	window int
+	samplePeriod time.Duration
+	futurePeriod int
+	rateToBuy float64
+	rateToSell float64
+	units float64
+	unitsByOp float64
+	internalClock int64
+	mutex sync.Mutex
+
+	samplesBid map[string][]float64
+	samplesAsk map[string][]float64
+}
+
+type feedStruc struct {
+	Instrument string `json:"instrument"`
+	Time string `json:"time"`
+	Bid float64 `json:"bid"`
+	Ask float64 `json:"ask"`
+}
+
+func (oracle *oracleStruc) collectSamples() {
+	var feeds map[string][]feedStruc
+
+	fa, _ := os.OpenFile("usd_rate_ask.csv", os.O_APPEND|os.O_WRONLY, 0600)
+	defer fa.Close()
+	fb, _ := os.OpenFile("usd_rate_bid.csv", os.O_APPEND|os.O_WRONLY, 0600)
+	defer fb.Close()
+
+	currenciesList := make([]string, len(oracle.currencies))
+	oracle.samplesBid = make(map[string][]float64)
+	oracle.samplesAsk = make(map[string][]float64)
+	for i := 0; i < len(oracle.currencies); i++ {
+		currenciesList[i] = fmt.Sprintf("%s_%s", oracle.baserCurr, oracle.currencies[i])
+
+		oracle.samplesBid[oracle.currencies[i]] = []float64{}
+		oracle.samplesAsk[oracle.currencies[i]] = []float64{}
+	}
+	feedsUrl := FEEDS_URL + strings.Join(currenciesList, "%2C")
+	fmt.Println("Parsing feeds from:", feedsUrl)
+
+	for {
+		initTime := time.Now().UnixNano()
+
+		resp, _ := http.Get(feedsUrl)
+		body, _ := ioutil.ReadAll(resp.Body)
+		err := json.Unmarshal(body, &feeds)
+		if err != nil {
+			fmt.Println("Error:", err)
+			continue
+		}
+
+		oracle.mutex.Lock()
+		for _, feed := range feeds["prices"] {
+			curr := feed.Instrument[len(oracle.baserCurr) + 1:]
+
+			oracle.samplesBid[curr] = append(oracle.samplesBid[curr], feed.Bid)
+			oracle.samplesAsk[curr] = append(oracle.samplesAsk[curr], feed.Ask)
+
+			if len(oracle.samplesBid[curr]) > oracle.samplesToStudy {
+				oracle.samplesBid[curr] = oracle.samplesBid[curr][1:]
+				oracle.samplesAsk[curr] = oracle.samplesAsk[curr][1:]
+			}
+
+			if curr == "USD" {
+				fb.WriteString(strconv.FormatInt(oracle.internalClock, 10) + " " + strconv.FormatFloat(feed.Bid, 'e', -1, 64) + "\n")
+				fa.WriteString(strconv.FormatInt(oracle.internalClock, 10) + " " + strconv.FormatFloat(feed.Ask, 'e', -1, 64) + "\n")
+			}
+		}
+		oracle.mutex.Unlock()
+
+		oracle.internalClock++
+		time.Sleep((oracle.samplePeriod * time.Millisecond) - time.Duration((time.Now().UnixNano() - initTime) / 1000000))
+	}
+
+	return
+}
+
+func getVariations(pric []float64) (r []float64) {
+	r = make([]float64, len(pric) - 1)
+	for i := 0; i < len(pric) - 1; i++ {
+		r[i] = pric[i + 1] / pric[i]
+	}
+
+	return
+}
+
+func (oracle *oracleStruc) makePredictions(curr string) {
+	invertedUnits := 0.0
+	f, _ := os.OpenFile("usd_actions.csv", os.O_APPEND|os.O_WRONLY, 0600)
+	defer f.Close()
+
+	for {
+		if len(oracle.samplesBid[curr]) < oracle.samplesToStudy {
+			fmt.Println("Waiting... current size:", len(oracle.samplesBid[curr]))
+			time.Sleep(1000 * time.Millisecond)
+		} else {
+			// Make a copy of the objects in order to avoid problems when update the rates
+			oracle.mutex.Lock()
+			samplesBid := make([]float64, len(oracle.samplesBid[curr]))
+			copy(samplesBid, oracle.samplesBid[curr])
+			samplesAsk := make([]float64, len(oracle.samplesAsk[curr]))
+			copy(samplesAsk, oracle.samplesAsk[curr])
+			variations := getVariations(oracle.samplesBid[curr])
+			oracle.mutex.Unlock()
+
+			normalizedVars, _ := ml.Normalize(variations)
+
+			x := [][]float64{}
+			y := []float64{}
+			for i := 0; i < len(variations) - oracle.window - oracle.futurePeriod; i++ {
+				x = append(x, normalizedVars[i:i + oracle.window])
+
+				incr := samplesBid[i + oracle.window + oracle.futurePeriod - 1] / samplesAsk[i + oracle.window]
+				y = append(y,  incr)
+			}
+
+			reg := &ml.Regression {
+				X: ml.PrepareX(x, 2),
+				Y: y,
+				LinearReg: true,
+			}
+			reg.InitializeTheta()
+			ml.Fmincg(reg, 0.001, 1000, false)
+
+			j, _, _ := reg.CostFunction(0.001, false)
+			lastVar := ml.PrepareX([][]float64{normalizedVars[len(normalizedVars) - oracle.window:]}, 2)[0]
+			hip := reg.LinearHipotesis(lastVar)
+
+			fmt.Println("Units:", oracle.units, "Cost:", j, "Hip:", hip, "Current Ratio:", samplesAsk[len(samplesAsk) - 1])
+
+			if hip - 1 > oracle.rateToBuy && invertedUnits == 0 {
+				oracle.units -= oracle.unitsByOp
+				invertedUnits = oracle.unitsByOp / samplesAsk[len(samplesAsk) - 1]
+				fmt.Println(CLR_R, "BUY!!! :", samplesAsk[len(samplesAsk) - 1], CLR_N)
+
+				if curr == "USD" {
+					f.WriteString(strconv.FormatInt(oracle.internalClock, 10) + " 1\n")
+				}
+			}
+
+			if 1 - hip > oracle.rateToSell && invertedUnits != 0 {
+				oracle.units += invertedUnits * samplesBid[len(samplesBid) - 1]
+				invertedUnits = 0
+				fmt.Println(CLR_R, "SELL!!!", samplesBid[len(samplesBid) - 1], CLR_N)
+
+				if curr == "USD" {
+					f.WriteString(strconv.FormatInt(oracle.internalClock, 10) + " 2\n")
+				}
+			}
+
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+}
+
+func Start(baserCurr string, currencies []string, samplesToStudy int, window int, samplePeriod time.Duration, futurePeriod int, rateToBuy float64, rateToSell float64, unitsByOp float64) (oracle *oracleStruc, err error) {
+	oracle = &oracleStruc {
+		baserCurr: baserCurr,
+		currencies: currencies,
+		window: window,
+		samplePeriod: samplePeriod,
+		samplesToStudy: samplesToStudy,
+		futurePeriod: futurePeriod,
+		rateToBuy: rateToBuy,
+		rateToSell: rateToSell,
+		units: 100,
+		unitsByOp: unitsByOp,
+		internalClock: 0,
+	}
+
+	go oracle.collectSamples()
+	/*for _, curr := range(currencies) {
+		go oracle.makePredictions(curr)
+	}*/
+
+	oracle.makePredictions("USD")
+	for {
+		time.Sleep(1000000000 * time.Millisecond)
+	}
+	return
+}

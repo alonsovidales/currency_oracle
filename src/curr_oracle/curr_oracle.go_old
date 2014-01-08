@@ -1,0 +1,261 @@
+package curr_oracle
+
+import (
+	"encoding/csv"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"os"
+	"strconv"
+	"math"
+	"github.com/alonsovidales/go_ml"
+)
+
+const (
+	CLR_0 = "\x1b[30;1m"
+	CLR_R = "\x1b[31;1m"
+	CLR_G = "\x1b[32;1m"
+	CLR_Y = "\x1b[33;1m"
+	CLR_B = "\x1b[34;1m"
+	CLR_M = "\x1b[35;1m"
+	CLR_C = "\x1b[36;1m"
+	CLR_W = "\x1b[37;1m"
+	CLR_N = "\x1b[0m"
+
+	DAYS_TO_CONSIDERER_INC = 3
+	DAYS_TO_STUDY = 1300
+	REFUSE_HIP_BOUNDARY = 0.1
+
+	VERBOSE = false
+)
+
+type feedsStruc struct {
+	dates []string // All the dates in format yyyy-mm-dd contained on this instance
+	// All the prices by currrency, the key is the currency and each value a price
+	// by one of the dates inthe same order as the dates array
+	pricesByCurr map[string][]float64
+	currOrder []string
+}
+
+func normalizeCurrExange(x []float64) (res []float64) {
+	max := math.Inf(-1)
+	min := math.Inf(1)
+
+	for i := 0; i < len(x); i++ {
+		if x[i] > max {
+			max = x[i]
+		}
+		if x[i] < min {
+			min = x[i]
+		}
+	}
+
+	res = make([]float64, len(x))
+	for i := 0; i < len(x); i++ {
+		res[i] = (x[i] + min) / (max + min)
+	}
+
+	return
+}
+
+// Returns all the price rate variations normalized for the given feeds
+func (feeds *feedsStruc) getNormalizedVariations()(vars map[string][]float64, normVars map[string][]float64) {
+	normVars = make(map[string][]float64)
+	vars = make(map[string][]float64)
+
+	// Calculates all the differences between days for each currency and for all the
+	// days. The last variation will be the difference between the last day and the
+	// day after
+	for curr, values := range feeds.pricesByCurr {
+		variations := make([]float64, len(values) - 1)
+		for i := 0; i < len(values) - 1; i++ {
+			//variations[i] = values[i + 1] - values[i]
+			variations[i] = values[i + 1] / values[i]
+		}
+
+		//vars[curr] = normalizeCurrExange(variations)
+		vars[curr] = variations
+		// We don't need to normalize this values, will oscilate near to zero
+		normVars[curr], _ = ml.Normalize(variations)
+	}
+
+	return
+}
+
+func getYPos(x []float64) int {
+	for i, v := range x {
+		if v == 1 {
+			return i
+		}
+	}
+
+	return -1
+}
+
+func (feeds *feedsStruc)getLogisticPredictionsByCurr(daysInTheFuture int) (predictions map[string]bool) {
+	vars, normVars := feeds.getNormalizedVariations()
+
+	for _, curr := range feeds.currOrder {
+		// Each set of x (sec dim) will contain DAYS_TO_CONSIDERER_INC numbers by
+		// currency that will be the days to study, the order of currencies are defined
+		// by feeds.currOrder
+		x := [][]float64{}
+		y := []float64{}
+		types := map[string][]int{}
+		for _, curr := range feeds.currOrder {
+			types[curr] = make([]int, 3)
+		}
+
+		for i := 0; i < len(feeds.dates) - daysInTheFuture - DAYS_TO_CONSIDERER_INC; i++ {
+			xAux := []float64{}
+			// Use Gold as bias
+			for _, val := range(normVars["XAU"][i:i + DAYS_TO_CONSIDERER_INC]) {
+				xAux = append(xAux, val)
+			}
+
+			for _, val := range(normVars[curr][i:i + DAYS_TO_CONSIDERER_INC]) {
+				xAux = append(xAux, val)
+			}
+			x = append(x, xAux)
+
+			if vars[curr][i + DAYS_TO_CONSIDERER_INC + daysInTheFuture - 1] > 1 {
+				y = append(y, 1.0)
+			} else {
+				y = append(y, 0.0)
+			}
+		}
+
+		// Linear / Logistic regression test
+		fmt.Printf("\nTraining Currency %s%s%s:\n", CLR_B, curr, CLR_N)
+
+		lr := &ml.Regression {
+			X: x,
+			Y: y,
+			LinearReg: false,
+		}
+		lr.X = ml.PrepareX(lr.X, 1)
+		lr.InitializeTheta()
+		_, _, lambda, testData := lr.MinimizeCost(30000, true, false)
+		lastFeed := make([]float64, len(lr.X[0]))
+		copy(lastFeed, lr.X[len(lr.X) - 1])
+
+		errors := 0.0
+		usedValues := 0.0
+		for i := 1; i < len(testData.X); i++ {
+			h := testData.LogisticHipotesis(testData.X[i])
+			if (math.Abs(h - 0.5) >= REFUSE_HIP_BOUNDARY) {
+				usedValues++
+				if (testData.Y[i] == 1) != (h > 0.5) {
+					if VERBOSE {
+						fmt.Println(CLR_R, "Value:", testData.Y[i], "H:", h, CLR_N)
+					}
+					errors++
+				} else {
+					if VERBOSE {
+						fmt.Println(CLR_G, "Value:", testData.Y[i], "H:", h, CLR_N)
+					}
+				}
+			}
+		}
+
+		// Train with all the available feeds
+		ml.Fmincg(lr, lambda, 10000, false)
+
+		incProb := lr.LogisticHipotesis(lastFeed)
+		var color string
+		if (incProb - 0.5 > REFUSE_HIP_BOUNDARY) {
+			color = CLR_G
+		} else {
+			color = CLR_R
+		}
+		fmt.Printf("%sIncrease probability (%s): %.2f %%%s\n", color, feeds.dates[len(feeds.dates) - 1], incProb * 100, CLR_N)
+		fmt.Printf("Predictions: %.2f %%\n", (usedValues / float64(len(testData.X))) * 100.0)
+		fmt.Printf("Global Err Probability: %.2f %%\n", (errors / float64(len(testData.X))) * 100.0)
+		fmt.Printf("Prediciton Errors: %.2f %%\n", ((errors / usedValues)) * 100.0)
+	}
+
+	return
+}
+
+func (feeds *feedsStruc)MakePredictions(daysInTheFuture int) {
+	fmt.Printf("Prediction for +%d days in the future\n", daysInTheFuture)
+
+	// Use logistic regression in order to calculate when the currency exange ratio
+	// will increase or decrease, we will base this predictio in the last n days
+	//feeds := feeds.getFeedsForLogRegresion()
+	feeds.getLogisticPredictionsByCurr(daysInTheFuture)
+}
+
+// Reads from the specified directory all the feed located in files named
+// yyyy-mm-dd.csv and stores all the information in an instance of feeds
+func NewFromFeeds(dir string, currToStudy map[string]bool) (feeds *feedsStruc, err error) {
+	fmt.Println("Parsing: ", dir)
+
+	currInitted := false
+	curr := make(map[string][]float64)
+
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	dates := []string{}
+	for _, f := range files {
+		if !f.IsDir() {
+			file, errAux := os.Open(fmt.Sprintf("%s/%s", dir, f.Name()))
+			if errAux != nil {
+				fmt.Printf("Problem trying to read the instructions file: %s : %s\n", f.Name(), errAux)
+				err = errAux
+				return
+			}
+			defer file.Close()
+
+			reader := csv.NewReader(file)
+		csvParser:
+			for {
+				record, errRead := reader.Read()
+				// End of the file, send the SHUTDOWN to switch off the robot
+				if errRead == io.EOF {
+					break csvParser
+				} else if errRead != nil {
+					fmt.Printf("Problem trying parse the instructions file: %s : %s\n", f.Name(), errRead)
+					err = errRead
+					return
+				}
+
+				if _, ok := currToStudy[record[1]]; ok {
+					ratio, errRat := strconv.ParseFloat(record[2], 64)
+					if errRat != nil {
+						fmt.Printf("Problem parsing on file: %s, ratio: %s\n", f.Name(), errRat)
+						err = errRat
+						return
+					}
+					if currInitted {
+						curr[record[1]] = append(curr[record[1]], ratio)
+					} else {
+						curr[record[1]] = []float64{ratio}
+					}
+				}
+			}
+			currInitted = true
+			dates = append(dates, f.Name()[:10])
+
+			file.Close()
+		}
+	}
+
+	currOrder := []string{}
+	for currName, _ := range currToStudy {
+		currOrder = append(currOrder, currName)
+		curr[currName] = curr[currName][len(dates) - DAYS_TO_STUDY:]
+	}
+
+	feeds = &feedsStruc{
+		dates: dates[len(dates) - DAYS_TO_STUDY:],
+		pricesByCurr:  curr,
+		currOrder:  currOrder,
+	}
+
+	fmt.Printf("Parse finished, %d files processed\n", len(dates))
+
+	return
+}
