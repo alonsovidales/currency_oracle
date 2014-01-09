@@ -29,7 +29,7 @@ const (
 	VERBOSE = false
 	PRODUCTION = false
 
-	THRENDS_TO_CONSIDER = 5
+	THRENDS_TO_CONSIDER = 0
 	MAX_BENEFIT_TO_CONSIDERER = 10
 
 	INCR_MARGIN = 1.0
@@ -46,6 +46,7 @@ type oracleStruc struct {
 	internalClock int64
 	mutex sync.Mutex
 	account *accountStruct
+	maxUnitsInUse bool
 
 	samplesBid map[string][]float64
 	samplesAsk map[string][]float64
@@ -175,14 +176,14 @@ func isThrendValid(validThrends []float64, invalidThrends []float64, thrend floa
 	return costValid <= costInvalid
 }
 
-func sumArr(x []float64) (r float64) {
+func calcBeneficts(x []float64) (r float64) {
 	for i := 0; i < len(x); i++ {
-		r += x[i]
+		r += x[i] * (1.0 + (float64(i + 1) / 10.0))
 	}
 	return
 }
 
-func (oracle *oracleStruc) makePredictions(curr string, futurePeriod int, samplesToStudy int) {
+func (oracle *oracleStruc) makePredictions(curr string, futurePeriod int, futurePeriodToSell int, samplesToStudy int) {
 	var boughtAt, threndAt float64
 
 	inverted := 0.0
@@ -191,10 +192,12 @@ func (oracle *oracleStruc) makePredictions(curr string, futurePeriod int, sample
 	unitsByOp := 1.0
 	exangeAt := 0.0
 	benefit := []float64{}
+	showedStarts := false
+	usedMaxUnits := false
 
 	for {
 		if len(oracle.samplesBid[curr]) < samplesToStudy {
-			fmt.Println("Waiting...", samplesToStudy, futurePeriod, curr, "current size:", len(oracle.samplesBid[curr]))
+			fmt.Println("Waiting...", samplesToStudy, futurePeriod, futurePeriodToSell, curr, "current size:", len(oracle.samplesBid[curr]))
 			time.Sleep(1000 * time.Millisecond)
 		} else {
 			// Make a copy of the objects in order to avoid problems when update the rates
@@ -206,56 +209,75 @@ func (oracle *oracleStruc) makePredictions(curr string, futurePeriod int, sample
 			oracle.mutex.Unlock()
 
 			futBid, thrend := getFutureBidPrice(samplesBid, futurePeriod)
-			currentBid := samplesBid[len(samplesBid) - 1]
-			currentAsk := samplesAsk[len(samplesAsk) - 1]
+			futBidSell, _ := getFutureBidPrice(samplesBid, futurePeriodToSell)
+			currentBid := samplesBid[len(samplesBid) - 1] // We sell at this price
+			currentAsk := samplesAsk[len(samplesAsk) - 1] // We buy at this price
 
 			/*if inverted != 0 {
 				fmt.Println("Thrend:", thrend)
 			}*/
 
-			if sumArr(benefit) > 0 {
-				unitsByOp = oracle.unitsByOp
-			} else {
-				unitsByOp = 1
-			}
-
 			// Buy
 			if futBid > (currentAsk * INCR_MARGIN) && inverted == 0 && isThrendValid(validThrends, invalidThrends, thrend) {
-				order, err := oracle.account.placeOrder(
-					fmt.Sprintf("%s_%s", oracle.baserCurr, curr),
-					unitsByOp,
-					"buy")
+				orderPrice := currentAsk
+				realOp := ""
+				if calcBeneficts(benefit) > 0 && len(benefit) == MAX_BENEFIT_TO_CONSIDERER && !oracle.maxUnitsInUse {
+					realOp = "Real"
+					oracle.maxUnitsInUse = true
+					usedMaxUnits = true
+					unitsByOp = oracle.unitsByOp
 
-				if err != nil {
-					fmt.Println("Error placing order:", err)
+					order, err := oracle.account.placeOrder(
+						fmt.Sprintf("%s_%s", oracle.baserCurr, curr),
+						unitsByOp,
+						"buy")
+					if err != nil {
+						fmt.Println("Error placing order:", err)
+					} else {
+						orderPrice = order.Price
+					}
 				} else {
-					oracle.units -= unitsByOp
-					inverted = unitsByOp / order.Price
-					boughtAt = order.Price
-					threndAt = thrend
-					exangeAt = thrend
-					fmt.Println(CLR_R, oracle.internalClock, "Buy:", curr, samplesToStudy, futurePeriod, order.Price, oracle.units, CLR_N)
+					unitsByOp = 1
 				}
+
+				oracle.units -= unitsByOp
+				inverted = unitsByOp / orderPrice
+				boughtAt = orderPrice
+				threndAt = thrend
+				exangeAt = thrend
+
+				fmt.Println(CLR_R, oracle.internalClock, "Buy:", realOp, curr, samplesToStudy, futurePeriod, futurePeriodToSell, orderPrice, oracle.units, "Inv:", unitsByOp, "Benef:", calcBeneficts(benefit), len(benefit), oracle.maxUnitsInUse,  CLR_N)
 			}
 
 			// Sell
-			if inverted != 0 && futBid < currentBid {
-				order, err := oracle.account.placeOrder(
-					fmt.Sprintf("%s_%s", oracle.baserCurr, curr),
-					unitsByOp,
-					"sell")
+			if inverted != 0 && (futBidSell < currentBid) {
+				orderPrice := currentBid
+				realOp := ""
+				if unitsByOp != 1 {
+					realOp = "Real"
+					order, err := oracle.account.placeOrder(
+						fmt.Sprintf("%s_%s", oracle.baserCurr, curr),
+						unitsByOp,
+						"sell")
 
-				if err != nil {
-					fmt.Println("Error placing order:", err)
-				} else {
-					oracle.units += inverted * order.Price
-					inverted = 0
-					benefit = append(benefit, order.Price - boughtAt)
-					if len(benefit) > MAX_BENEFIT_TO_CONSIDERER {
-						benefit = benefit[1:]
+					if err != nil {
+						fmt.Println("Error placing order:", err)
+					} else {
+						orderPrice = order.Price
 					}
-					fmt.Println(CLR_G, oracle.internalClock, "Sell:", curr, samplesToStudy, futurePeriod, order.Price, oracle.units, "Diff:", order.Price - boughtAt, "Thernd at:", threndAt, "Benefit:", sumArr(benefit), CLR_N)
 				}
+
+				oracle.units += inverted * orderPrice
+				inverted = 0
+				benefit = append(benefit, orderPrice - boughtAt)
+				if usedMaxUnits {
+					oracle.maxUnitsInUse = false
+					usedMaxUnits = false
+				}
+				if len(benefit) > MAX_BENEFIT_TO_CONSIDERER {
+					benefit = benefit[1:]
+				}
+				fmt.Println(CLR_G, oracle.internalClock, "Sell:", realOp, curr, samplesToStudy, futurePeriod, futurePeriodToSell, orderPrice, oracle.units, "Diff:", orderPrice - boughtAt, "Thernd at:", threndAt, "Benefit:", calcBeneficts(benefit), CLR_N)
 
 				if (currentBid - boughtAt) > 0 {
 					validThrends = append(validThrends, exangeAt)
@@ -268,8 +290,15 @@ func (oracle *oracleStruc) makePredictions(curr string, futurePeriod int, sample
 						invalidThrends = invalidThrends[1:]
 					}
 				}
-				fmt.Println("Valid thrends:", curr, samplesToStudy, futurePeriod, validThrends)
-				fmt.Println("Invalid thrends:", curr, samplesToStudy, futurePeriod, invalidThrends)
+				fmt.Println("Valid thrends:", curr, samplesToStudy, futurePeriod, futurePeriodToSell, validThrends)
+				fmt.Println("Invalid thrends:", curr, samplesToStudy, futurePeriod, futurePeriodToSell, invalidThrends)
+			}
+
+			if oracle.internalClock % 100 == 0 && !showedStarts {
+				showedStarts = true
+				fmt.Println(CLR_G, "Stats:", curr, samplesToStudy, futurePeriod, futurePeriodToSell, "Benefit:", calcBeneficts(benefit), CLR_N)
+			} else {
+				showedStarts = false
 			}
 
 			time.Sleep((oracle.samplePeriod / 3) * time.Millisecond)
@@ -291,13 +320,16 @@ func Start(currencies []string, samplesToStudy int, futurePeriod int, samplePeri
 		unitsByOp: unitsByOp,
 		internalClock: 0,
 		account: account,
+		maxUnitsInUse: false,
 	}
 
 	go oracle.collectSamples()
 	for _, curr := range(currencies) {
 		for f := 1; f <= futurePeriod; f++ {
-			for s := 2; s <= samplesToStudy; s++ {
-				go oracle.makePredictions(curr, f, s)
+			for fs := 1; fs <= futurePeriod; fs++ {
+				for s := 2; s <= samplesToStudy; s++ {
+					go oracle.makePredictions(curr, f, fs, s)
+				}
 			}
 		}
 	}

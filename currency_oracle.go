@@ -48,7 +48,7 @@ func main() {
 
 		},
 		5,  // samplesToStudy
-		2,    // futurePeriod
+		3,    // futurePeriod
 		500,  // samplePeriod
 		500) // unitsByOp
 
